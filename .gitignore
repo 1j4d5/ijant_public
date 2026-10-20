@@ -1,0 +1,29 @@
+# Secret environment variables (NEVER commit to GitHub)
+.env
+.env.*
+*.env
+
+# Local SQLite databases & cache
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# Private local sync & utility scripts (keep only displayerv2 for public repo)
+uploader.py
+b2_resetter.py
+sql_setter.py
+NEXT_UPDATE.md
+
+# OS files
+.DS_Store
+Thumbs.db
