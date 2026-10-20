@@ -6,7 +6,7 @@ Routes:
   /people      -> People gallery grid
   /people/<id> -> Person detail page with photo grid + lightbox
   /images      -> All images grid
-  /photo/<id>  -> Presigned URL redirect for images
+  /photo/<id>  -> Proxied image served from IJUS storage
   /api/...     -> JSON data endpoints
 """
 from __future__ import annotations
@@ -14,12 +14,11 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-import boto3
-from botocore.config import Config
+import requests
 from dotenv import load_dotenv
-from flask import Flask, abort, jsonify, redirect, render_template_string
+from flask import Flask, Response, abort, jsonify, render_template_string, send_from_directory, stream_with_context
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
@@ -28,17 +27,12 @@ BASE = Path(__file__).resolve().parent
 ENV_PATH = BASE / ".env"
 load_dotenv(ENV_PATH)
 
-B2_ENDPOINT_RAW = os.getenv("B2_ENDPOINT_URL", "s3.us-east-005.backblazeb2.com").strip()
-if B2_ENDPOINT_RAW and not B2_ENDPOINT_RAW.startswith(("http://", "https://")):
-    B2_ENDPOINT_URL = f"https://{B2_ENDPOINT_RAW}"
-else:
-    B2_ENDPOINT_URL = B2_ENDPOINT_RAW
+PHOTO_CACHE_DIR = Path(os.getenv("PHOTO_CACHE_DIR", str(BASE / ".cache" / "photos"))).resolve()
+PHOTO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-B2_BUCKET = (os.getenv("B2_BUCKET_NAME") or os.getenv("B2_BUCKET") or "ijantdata").strip()
-B2_KEY_ID = os.getenv("B2_KEY_ID", "").strip()
-B2_APP_KEY = os.getenv("B2_APPLICATION_KEY", "").strip()
-B2_REGION = os.getenv("B2_REGION", "us-west-004").strip()
-PRESIGNED_TTL = int(os.getenv("B2_PRESIGNED_URL_TTL", "3600"))
+IJUS_TOKEN     = os.getenv("IJUS_TOKEN", "").strip()
+IJUS_BASE_URL  = os.getenv("IJUS_BASE_URL", "https://pink.ijadium.com/bucket").rstrip("/")
+IJUS_BUCKET    = (os.getenv("IJUS_BUCKET_NAME") or "ijantdata").strip()
 
 NEON_DB_URL = os.getenv("NEON_DB_URL", "").strip()
 SQLITE_FALLBACK = Path(os.getenv("IJANT_PUBLIC_DB_PATH", str(BASE / "public.ijant.sqlite"))).resolve()
@@ -48,25 +42,7 @@ PORT = int(os.getenv("GALLERY_PORT", "5050"))
 
 app = Flask(__name__)
 
-_S3_CLIENT = None
-
-def get_s3_client():
-    global _S3_CLIENT
-    if _S3_CLIENT is None:
-        if not all([B2_KEY_ID, B2_APP_KEY, B2_BUCKET]):
-            abort(503, description="B2 configuration is incomplete.")
-        _S3_CLIENT = boto3.client(
-            "s3",
-            endpoint_url=B2_ENDPOINT_URL,
-            aws_access_key_id=B2_KEY_ID,
-            aws_secret_access_key=B2_APP_KEY,
-            region_name=B2_REGION,
-            config=Config(signature_version="s3v4", max_pool_connections=25),
-        )
-    return _S3_CLIENT
-
 _IMAGE_KEY_CACHE: Dict[int, str] = {}
-_PRESIGNED_CACHE: Dict[int, Tuple[str, float]] = {}
 _DB_POOL: Optional[ThreadedConnectionPool] = None
 
 def get_db_conn():
@@ -136,6 +112,13 @@ main { padding:32px clamp(16px,4vw,56px); max-width:1600px; margin:auto; }
 .skel { border:1px solid var(--line); border-radius:14px; overflow:hidden; }
 .skel-img { width:100%; background:#1c222e; animation:pulse 1.5s ease-in-out infinite; }
 @keyframes pulse { 0%,100%{opacity:.4} 50%{opacity:.8} }
+/* ── Mobile shared ── */
+@media(max-width:600px){
+  main { padding:20px 14px; }
+  .page-hdr { margin-bottom:18px; }
+  .nav-link { padding:5px 10px; font-size:13px; }
+  header { padding:10px 14px; }
+}
 """
 
 _JS = """
@@ -143,6 +126,39 @@ function esc(s) {
   return String(s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 function imgUrl(id){ return '/photo/'+id; }
+
+// ── Image retry / error handler ───────────────────────────────────────────────
+// Attach onerror="imgRetry(this)" to any <img> to get silent retries.
+// After 3 failures, swaps in a clean placeholder — no broken-icon ever shown.
+function imgRetry(img) {
+  // Suppress the broken-icon immediately
+  img.style.opacity = '0';
+  const tries = parseInt(img.dataset.retries || '0', 10);
+  const MAX = 3;
+  const delays = [1000, 3000, 6000];
+  if (tries < MAX) {
+    img.dataset.retries = tries + 1;
+    setTimeout(() => {
+      const base = img.dataset.origSrc || img.src.split('?')[0];
+      img.dataset.origSrc = base;
+      img.src = base + '?r=' + tries;          // cache-bust so browser re-fetches
+    }, delays[tries]);
+    // Show a subtle shimmer while retrying
+    img.style.background = '#1c222e';
+    img.style.transition = 'opacity .3s';
+  } else {
+    // Give up — replace with a clean placeholder, not a broken icon
+    const w = img.clientWidth  || img.closest('[style*="aspect"]')?.clientWidth  || 120;
+    const h = img.clientHeight || w;
+    const ph = document.createElement('div');
+    ph.style.cssText = `width:${w}px;height:${h}px;max-width:100%;background:#12161f;` +
+      `display:flex;align-items:center;justify-content:center;` +
+      `color:#3a4255;font-size:22px;border-radius:inherit;`;
+    ph.title = 'Image unavailable';
+    ph.textContent = '🖼';
+    img.replaceWith(ph);
+  }
+}
 """
 
 def _nav(active):
@@ -275,7 +291,7 @@ function render(list){
   g.innerHTML=list.map(p=>`
     <a class="person" href="/people/${p.id}">
       ${p.cover_photo_id
-        ? `<img loading="lazy" src="${imgUrl(p.cover_photo_id)}" alt="${esc(p.name)}">`
+        ? `<img loading="lazy" src="${imgUrl(p.cover_photo_id)}" onerror="imgRetry(this)" alt="${esc(p.name)}">` 
         : `<div class="nophoto">?</div>`
       }
       <div class="meta"><strong>${esc(p.name)}</strong><span class="muted">${p.photo_count} photo${p.photo_count===1?'':'s'}</span></div>
@@ -359,12 +375,18 @@ def _person_page():
 #lbCounter { position:absolute; bottom:14px; left:50%; transform:translateX(-50%); color:#d3d7e0;
   font-size:13px; background:rgba(23,27,36,.7); padding:5px 14px; border-radius:20px;
   border:1px solid var(--line); white-space:nowrap; }
+@media(max-width:500px){
+  .photos,.skel-grid{ grid-template-columns:repeat(2,1fr); gap:7px; }
+}
 @media(max-width:600px){
-  .photos,.skel-grid{ grid-template-columns:repeat(2,1fr); gap:8px; }
-  #lightbox{ padding:60px 8px 50px; }
-  #lbPrev{ left:6px; } #lbNext{ right:6px; }
-  #lbToggle{ right:90px; padding:8px 12px; font-size:12px; }
-  #lbClose{ padding:8px 12px; font-size:12px; }
+  #lightbox{ padding:54px 0 0; flex-direction:column; }
+  #viewer{ max-width:100vw; max-height:calc(100svh - 90px); width:100%; }
+  #viewer img{ max-height:calc(100svh - 90px); border-radius:0; }
+  #lbPrev{ left:0; padding:18px 14px; border-radius:0 10px 10px 0; }
+  #lbNext{ right:0; padding:18px 14px; border-radius:10px 0 0 10px; }
+  #lbToggle{ top:10px; right:84px; padding:7px 10px; font-size:12px; }
+  #lbClose{ top:10px; right:8px; padding:7px 10px; font-size:12px; }
+  .back-bar{ flex-wrap:wrap; gap:8px; margin-bottom:16px; }
 }
 </style></head><body>""" + _nav("people") + r"""
 <main>
@@ -420,7 +442,7 @@ function showPhoto(i) {
   const boxes = (ph.faces||[]).map(f=>
     `<div class="face-box" data-x1="${f.x1}" data-y1="${f.y1}" data-x2="${f.x2}" data-y2="${f.y2}" data-name="${esc(personName)}"></div>`
   ).join('');
-  document.getElementById('viewer').innerHTML = `<img id="lbImg" alt="Photo" src="${imgUrl(ph.id)}">${boxes}`;
+  document.getElementById('viewer').innerHTML = `<img id="lbImg" alt="Photo" src="${imgUrl(ph.id)}" onerror="imgRetry(this)">${boxes}`;
 
   // Show lightbox FIRST so dimensions are available (this is the critical fix!)
   document.getElementById('lightbox').classList.remove('hidden');
@@ -491,7 +513,7 @@ window.addEventListener('resize',()=>{
       const bx=(ph.faces||[]).map(f=>
         `<div class="face-box" data-x1="${f.x1}" data-y1="${f.y1}" data-x2="${f.x2}" data-y2="${f.y2}"></div>`
       ).join('');
-      return `<button class="photo-btn" data-i="${i}"><span class="frame"><img loading="lazy" src="${imgUrl(ph.id)}" alt="Photo ${i+1}">${bx}</span></button>`;
+      return `<button class="photo-btn" data-i="${i}"><span class="frame"><img loading="lazy" src="${imgUrl(ph.id)}" onerror="imgRetry(this)" alt="Photo ${i+1}">${bx}</span></button>`;
     }).join('');
     grid.classList.remove('hidden');
     grid.querySelectorAll('.photo-btn').forEach(btn=>{
@@ -522,8 +544,9 @@ def _images_page():
 <style>""" + _CSS + r"""
 .img-layout { display:grid; grid-template-columns:1fr 300px; gap:20px; align-items:start; }
 @media(max-width:900px){ .img-layout{ grid-template-columns:1fr; } .side-panel{ display:none!important; } }
-.masonry { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:10px; }
-.skel-grid { grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:10px; }
+.masonry { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:10px; }
+.skel-grid { grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:10px; }
+@media(max-width:500px){ .masonry,.skel-grid{ grid-template-columns:repeat(2,1fr); gap:7px; } }
 
 /* Image card with hover popover */
 .img-wrap { position:relative; }
@@ -657,10 +680,33 @@ def _images_page():
 .pm-loader { padding:40px; text-align:center; color:var(--muted); font-size:14px; }
 
 @media(max-width:600px){
-  #lb{ padding:60px 6px 50px; }
-  #lbPrev{ left:4px; } #lbNext{ right:4px; }
-  #lbTog{ right:90px; padding:8px 12px; font-size:12px; }
-  #lbClose{ padding:8px 12px; font-size:12px; }
+  /* Lightbox: full-bleed, bottom controls */
+  #lb{ padding:54px 0 0; flex-direction:column; }
+  #vwr{ max-width:100vw; max-height:calc(100svh - 110px); width:100%; }
+  #vwr img{ max-height:calc(100svh - 110px); border-radius:0; }
+  /* Prev/Next: big tap targets on sides */
+  #lbPrev{ left:0; padding:18px 14px; border-radius:0 10px 10px 0; }
+  #lbNext{ right:0; padding:18px 14px; border-radius:10px 0 0 10px; }
+  /* Top buttons: smaller, no overlap */
+  #lbTog{ top:10px; right:90px; padding:7px 10px; font-size:12px; }
+  #lbClose{ top:10px; right:10px; padding:7px 10px; font-size:12px; }
+  /* People panel: slide up from bottom as a sheet instead of sidebar */
+  #lbPeople{ display:block !important; position:fixed; bottom:0; right:0; left:0; top:auto;
+    transform:none; max-height:32vh; border-radius:16px 16px 0 0; min-width:unset; max-width:100%;
+    padding:10px 16px 20px; overflow-y:auto; }
+  #lbPeopleList{ flex-direction:row; flex-wrap:wrap; gap:10px; }
+  .lb-person{ width:auto; flex-direction:column; align-items:center; padding:6px 8px;
+    border-radius:10px; border:1px solid var(--line); min-width:60px; }
+  .lb-person .lb-pname{ font-size:11px; text-align:center; }
+  /* Counter: above people sheet */
+  #lbCnt{ bottom:calc(32vh + 6px); }
+  /* Face boxes toggle btn */
+  .grid-toolbar{ flex-wrap:wrap; gap:6px; }
+  #thumbTogBtn{ font-size:12px; padding:5px 10px; }
+  /* person modal full screen */
+  #personModalBox{ width:100%; max-height:95svh; border-radius:16px 16px 0 0; }
+  #personModal{ align-items:flex-end; padding:0; }
+  #personModalGrid{ grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); padding:12px; }
 }
 </style></head><body>""" + _nav("images") + r"""
 <main>
@@ -745,7 +791,7 @@ function faceCropAvatar(p, size) {
   return `<span id="${uid}" style="width:${size}px;height:${size}px;border-radius:50%;overflow:hidden;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;border:2px solid var(--line);background:#111;position:relative">
     <img id="${uid}-img" src="${imgUrl(p.cover_photo_id)}" alt="${esc(p.name)}" ${dataAttrs}
       style="width:100%;height:100%;object-fit:cover;transition:all .15s"
-      onload="applyFaceCrop(this)">
+      onerror="imgRetry(this)" onload="applyFaceCrop(this)">
   </span>`;
 }
 
@@ -842,7 +888,7 @@ async function openPersonModal(pid, name) {
     }
     document.getElementById('personModalGrid').innerHTML = p.photos.map((ph,i)=>`
       <button class="pm-photo" data-i="${i}" data-pid="${pid}">
-        <img loading="lazy" src="${imgUrl(ph.id)}" alt="Photo ${i+1}">
+        <img loading="lazy" src="${imgUrl(ph.id)}" onerror="imgRetry(this)" alt="Photo ${i+1}">
       </button>`).join('');
     // Clicking a photo in the person modal closes modal and opens full lightbox
     document.getElementById('personModalGrid').querySelectorAll('.pm-photo').forEach(btn=>{
@@ -877,7 +923,7 @@ function showPhoto(i) {
   const boxes = (ph.faces||[]).map(f=>
     `<div class="fbox" data-x1="${f.x1}" data-y1="${f.y1}" data-x2="${f.x2}" data-y2="${f.y2}" data-name="${esc(f.name||'')}"></div>`
   ).join('');
-  document.getElementById('vwr').innerHTML=`<img id="lbImg" src="${imgUrl(ph.id)}" alt="${esc(ph.original_name||'')}">${boxes}`;
+  document.getElementById('vwr').innerHTML=`<img id="lbImg" src="${imgUrl(ph.id)}" onerror="imgRetry(this)" alt="${esc(ph.original_name||'')}">${boxes}`;
   // Show FIRST so dimensions work
   document.getElementById('lb').classList.remove('hidden');
   document.body.style.overflow='hidden';
@@ -981,7 +1027,7 @@ function batch(){
     wrap.innerHTML = buildHoverPop(imgObj);
     const b=document.createElement('button');
     b.className='img-card';
-    b.innerHTML=`<img loading="lazy" src="${imgUrl(imgObj.id)}" alt="${esc(imgObj.original_name||'')}">
+    b.innerHTML=`<img loading="lazy" src="${imgUrl(imgObj.id)}" onerror="imgRetry(this)" alt="${esc(imgObj.original_name||'')}">
       <div class="img-label">${esc(imgObj.original_name||'Photo')}</div>`;
     b.onclick=()=>showPhoto(i);
     wrap.addEventListener('mouseenter',()=>updateSide(imgObj));
@@ -1263,11 +1309,6 @@ def list_images():
 @app.get("/photo/<int:image_id>")
 @app.get("/public-photo/<int:image_id>")
 def get_photo(image_id: int):
-    now = time.time()
-    cached = _PRESIGNED_CACHE.get(image_id)
-    if cached and cached[1] > now:
-        return redirect(cached[0], code=302)
-
     key = _IMAGE_KEY_CACHE.get(image_id)
     if not key:
         conn = get_db_conn()
@@ -1296,23 +1337,41 @@ def get_photo(image_id: int):
     if not key:
         abort(404, description="Photo not found")
 
+    # 1. Check local disk cache first
+    cached_path = PHOTO_CACHE_DIR / key
+    if cached_path.is_file() and cached_path.stat().st_size > 0:
+        resp = send_from_directory(PHOTO_CACHE_DIR, key, max_age=31536000)
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return resp
+
+    # 2. Fetch from IJUS storage, save to local disk cache, and serve
     try:
-        url = get_s3_client().generate_presigned_url(
-            "get_object",
-            Params={"Bucket": B2_BUCKET, "Key": key},
-            ExpiresIn=PRESIGNED_TTL,
-        )
-        _PRESIGNED_CACHE[image_id] = (url, now + 1800)
-        return redirect(url, code=302)
+        ijus_url = f"{IJUS_BASE_URL}/buckets/{IJUS_BUCKET}/files/{key}"
+        with requests.get(
+            ijus_url,
+            headers={"Authorization": f"Bearer {IJUS_TOKEN}"},
+            stream=True,
+            timeout=30,
+        ) as r:
+            r.raise_for_status()
+            tmp_path = PHOTO_CACHE_DIR / f"{key}.tmp.{os.getpid()}_{time.time_ns()}"
+            with open(tmp_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    if chunk:
+                        f.write(chunk)
+            tmp_path.replace(cached_path)
+
+        resp = send_from_directory(PHOTO_CACHE_DIR, key, max_age=31536000)
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return resp
     except Exception as exc:
-        app.logger.exception(f"Could not generate presigned URL for {key}: {exc}")
-        abort(502, description="Could not fetch image from B2.")
+        app.logger.exception(f"Could not fetch image {key} from IJUS: {exc}")
+        abort(502, description="Could not fetch image from IJUS.")
 
 
 @app.post("/api/refresh")
 def refresh():
     _IMAGE_KEY_CACHE.clear()
-    _PRESIGNED_CACHE.clear()
     conn = get_db_conn()
     if conn is not None:
         try:
@@ -1329,7 +1388,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print("IJANT Public Gallery Server - Multi-Page Edition")
     print(f"Neon Database: {'Configured' if NEON_DB_URL else 'NOT CONFIGURED'}")
-    print(f"B2 Bucket:     {B2_BUCKET} @ {B2_ENDPOINT_URL}")
+    print(f"IJUS Storage:  {IJUS_BASE_URL}/buckets/{IJUS_BUCKET}")
     print(f"Routes:        /  /people  /people/<id>  /images")
     print(f"Server URL:    http://{HOST}:{PORT}")
     print("=" * 60)

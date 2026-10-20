@@ -9,6 +9,8 @@
 *.sqlite-shm
 *.sqlite-wal
 *.db
+.cache/
+cache/
 
 # Python cache & virtual environments
 __pycache__/
