@@ -1,15 +1,8 @@
 {
-  "version": 2,
-  "builds": [
+  "rewrites": [
     {
-      "src": "displayerv2.py",
-      "use": "@vercel/python"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "displayerv2.py"
+      "source": "/(.*)",
+      "destination": "/api/index"
     }
   ]
 }

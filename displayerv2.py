@@ -12,6 +12,7 @@ Routes:
 from __future__ import annotations
 
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -27,8 +28,21 @@ BASE = Path(__file__).resolve().parent
 ENV_PATH = BASE / ".env"
 load_dotenv(ENV_PATH)
 
-PHOTO_CACHE_DIR = Path(os.getenv("PHOTO_CACHE_DIR", str(BASE / ".cache" / "photos"))).resolve()
-PHOTO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# In serverless environments (e.g. Vercel / AWS Lambda), the code directory is strictly read-only.
+# Only /tmp is writable.
+if os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
+    PHOTO_CACHE_DIR = Path("/tmp/photos")
+else:
+    PHOTO_CACHE_DIR = Path(os.getenv("PHOTO_CACHE_DIR", str(BASE / ".cache" / "photos"))).resolve()
+
+try:
+    PHOTO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    try:
+        PHOTO_CACHE_DIR = Path(tempfile.gettempdir()) / "photos"
+        PHOTO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
 
 IJUS_TOKEN     = os.getenv("IJUS_TOKEN", "").strip()
 IJUS_BASE_URL  = os.getenv("IJUS_BASE_URL", "https://pink.ijadium.com/bucket").rstrip("/")
@@ -49,19 +63,31 @@ def get_db_conn():
     global _DB_POOL
     if not NEON_DB_URL:
         return None
-    if _DB_POOL is None:
+    for attempt in range(2):
+        if _DB_POOL is None:
+            try:
+                _DB_POOL = ThreadedConnectionPool(1, 5, NEON_DB_URL, connect_timeout=10)
+            except Exception as e:
+                app.logger.warning(f"Failed to create DB pool: {e}")
+                return None
         try:
-            _DB_POOL = ThreadedConnectionPool(1, 10, NEON_DB_URL, connect_timeout=10)
-        except Exception:
-            return None
-    try:
-        conn = _DB_POOL.getconn()
-        if conn.closed:
-            _DB_POOL.putconn(conn)
             conn = _DB_POOL.getconn()
-        return conn
-    except Exception:
-        return None
+            if conn.closed:
+                _DB_POOL.putconn(conn)
+                conn = _DB_POOL.getconn()
+            # Liveness check: handles Neon closing idle serverless connections
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            return conn
+        except Exception as exc:
+            app.logger.warning(f"Connection test failed (attempt {attempt+1}): {exc}")
+            if _DB_POOL:
+                try:
+                    _DB_POOL.closeall()
+                except Exception:
+                    pass
+                _DB_POOL = None
+    return None
 
 def put_db_conn(conn):
     global _DB_POOL
@@ -1338,32 +1364,53 @@ def get_photo(image_id: int):
         abort(404, description="Photo not found")
 
     # 1. Check local disk cache first
-    cached_path = PHOTO_CACHE_DIR / key
-    if cached_path.is_file() and cached_path.stat().st_size > 0:
-        resp = send_from_directory(PHOTO_CACHE_DIR, key, max_age=31536000)
-        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-        return resp
+    try:
+        cached_path = PHOTO_CACHE_DIR / key
+        if cached_path.is_file() and cached_path.stat().st_size > 0:
+            resp = send_from_directory(PHOTO_CACHE_DIR, key, max_age=31536000)
+            resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+            return resp
+    except Exception:
+        cached_path = None
 
-    # 2. Fetch from IJUS storage, save to local disk cache, and serve
+    # 2. Fetch from IJUS storage, save to local disk cache if possible, and serve
     try:
         ijus_url = f"{IJUS_BASE_URL}/buckets/{IJUS_BUCKET}/files/{key}"
-        with requests.get(
+        r = requests.get(
             ijus_url,
             headers={"Authorization": f"Bearer {IJUS_TOKEN}"},
             stream=True,
             timeout=30,
-        ) as r:
-            r.raise_for_status()
-            tmp_path = PHOTO_CACHE_DIR / f"{key}.tmp.{os.getpid()}_{time.time_ns()}"
-            with open(tmp_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=65536):
-                    if chunk:
-                        f.write(chunk)
-            tmp_path.replace(cached_path)
+        )
+        r.raise_for_status()
 
-        resp = send_from_directory(PHOTO_CACHE_DIR, key, max_age=31536000)
-        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-        return resp
+        # Try to save to disk cache
+        saved = False
+        if cached_path is not None:
+            try:
+                PHOTO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                tmp_path = PHOTO_CACHE_DIR / f"{key}.tmp.{os.getpid()}_{time.time_ns()}"
+                with open(tmp_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        if chunk:
+                            f.write(chunk)
+                tmp_path.replace(cached_path)
+                saved = True
+            except Exception as cache_err:
+                app.logger.warning(f"Disk caching skipped for {key}: {cache_err}")
+
+        if saved and cached_path.is_file():
+            resp = send_from_directory(PHOTO_CACHE_DIR, key, max_age=31536000)
+            resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+            return resp
+        else:
+            # If disk write failed or caching is unavailable, stream directly from response
+            content_type = r.headers.get("Content-Type", "image/jpeg")
+            return Response(
+                stream_with_context(r.iter_content(chunk_size=65536)),
+                content_type=content_type,
+                headers={"Cache-Control": "public, max-age=31536000, immutable"},
+            )
     except Exception as exc:
         app.logger.exception(f"Could not fetch image {key} from IJUS: {exc}")
         abort(502, description="Could not fetch image from IJUS.")
